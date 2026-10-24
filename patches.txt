@@ -1,0 +1,5 @@
+# Branches of this fork stacked, in order, on top of each upstream release.
+# Each branch contributes the commits it has beyond its merge base with
+# upstream main. Remove a branch once upstream ships its change.
+feat/subtitle-delay-shortcuts
+fork/updater

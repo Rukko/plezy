@@ -1,0 +1,373 @@
+name: Custom Windows release
+run-name: ${{ github.event_name == 'schedule' && 'Scheduled check' || 'Manual build' }}
+
+# Rebuilds each upstream Plezy release for Windows with the branches listed in
+# patches.txt stacked on top, and publishes it as a release of this fork. The
+# build steps mirror upstream's build-windows and package-windows jobs
+# (.github/workflows/build.yml in edde746/plezy); keep them in step when
+# upstream changes how Windows is built.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: Upstream release tag to build (empty for the latest release)
+        default: ""
+        type: string
+      force:
+        description: Build a new revision even if these patches were already released
+        default: false
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: custom-windows-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: edde746/plezy
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+      tag: ${{ steps.plan.outputs.tag }}
+      version: ${{ steps.plan.outputs.version }}
+      build_number: ${{ steps.plan.outputs.build_number }}
+      release_tag: ${{ steps.plan.outputs.release_tag }}
+      fingerprint: ${{ steps.plan.outputs.fingerprint }}
+      heads: ${{ steps.plan.outputs.heads }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Decide what to build
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORK: ${{ github.repository }}
+          INPUT_TAG: ${{ inputs.upstream_tag }}
+          FORCE: ${{ inputs.force }}
+        run: bash scripts/plan.sh
+
+      - name: Stack patches on the upstream release
+        if: steps.plan.outputs.build == 'true'
+        env:
+          FORK: ${{ github.repository }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          BRANCHES: ${{ steps.plan.outputs.branches }}
+        run: |
+          git --version
+          # Branch names are space separated on purpose.
+          # shellcheck disable=SC2086
+          bash scripts/compose.sh "$TAG" patches $BRANCHES
+
+      - name: Upload patch series
+        if: steps.plan.outputs.build == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: patches
+          path: patches/
+
+  build-windows:
+    name: Build Windows (${{ matrix.arch }})
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+            flutter_setup: action
+            native_cache_path: build/windows/x64/_deps
+          - arch: arm64
+            runner: windows-11-arm
+            flutter_setup: git
+            native_cache_path: build/windows/arm64/_deps
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: refs/tags/${{ needs.plan.outputs.tag }}
+          persist-credentials: false
+
+      - name: Download patch series
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: patches
+          path: ${{ runner.temp }}/patches
+
+      - name: Apply patches and set the build number
+        id: source
+        shell: bash
+        run: |
+          git -c user.name=plezy-custom-build -c user.email=plezy-custom-build@users.noreply.github.com \
+            am --quiet "$RUNNER_TEMP"/patches/*.patch
+          sed -i -E 's/^version:[[:space:]]*[0-9]+\.[0-9]+\.[0-9]+\+[0-9]+/version: ${{ needs.plan.outputs.version }}+${{ needs.plan.outputs.build_number }}/' pubspec.yaml
+          grep -E '^version:' pubspec.yaml
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          flutter_version=$(sed -n -E 's/^[[:space:]]*FLUTTER_VERSION:[[:space:]]*"([^"]+)".*/\1/p' .github/workflows/build.yml)
+          echo "FLUTTER_VERSION=$flutter_version" >> "$GITHUB_ENV"
+
+      - name: Cache Windows native dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ matrix.native_cache_path }}
+          key: custom-windows-native-${{ matrix.arch }}-${{ hashFiles('windows/CMakeLists.txt', 'mpv-build.lock.json') }}
+
+      - name: Setup Flutter
+        if: matrix.flutter_setup == 'action'
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+          cache-key: "custom-flutter-:os:-:channel:-:version:-:arch:-:hash:"
+          pub-cache: false
+
+      - name: Set up Flutter from its pinned commit
+        if: matrix.flutter_setup == 'git'
+        uses: ./.github/actions/setup-flutter-git
+
+      - name: Cache Pub dependencies
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~\AppData\Local\Pub\Cache
+          key: custom-${{ runner.os }}-${{ runner.arch }}-pub-${{ hashFiles('pubspec.yaml', 'pubspec.lock') }}
+
+      - name: Install dependencies
+        shell: pwsh
+        run: flutter pub get --enforce-lockfile --no-example
+
+      # compose.sh keeps upstream's copy when only generated translations
+      # conflict, so they are rebuilt from the patched JSON sources here.
+      - name: Regenerate translations
+        shell: pwsh
+        run: dart run slang
+
+      - name: Install patched Flutter engine (DComp)
+        shell: pwsh
+        run: |
+          flutter precache --windows
+          .\windows\tool\install-patched-engine.ps1
+
+      - name: Build Windows ${{ matrix.arch }}
+        shell: pwsh
+        run: >-
+          flutter build windows --release
+          --dart-define=ENABLE_UPDATE_CHECK=true
+          --dart-define=GIT_COMMIT=${{ steps.source.outputs.commit }}
+          --dart-define=SENTRY_ENVIRONMENT=github
+          --dart-define=ENABLE_DONATIONS=true
+          --dart-define=SENTRY_DIST=github-windows-${{ matrix.arch }}
+          --dart-define=SUPPORTER_MODE=msstore
+          --split-debug-info=debug-info/windows-${{ matrix.arch }}
+
+      - name: Verify Windows bundle contents
+        shell: pwsh
+        run: |
+          $bundleDir = "build/windows/${{ matrix.arch }}/runner/Release"
+          foreach ($file in @("plezy.exe", "flutter_windows.dll", "libmpv-2.dll", "data/app.so", "msvcp140.dll", "vcruntime140.dll")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $bundleDir $file))) {
+              throw "Required Windows bundle file is missing: $file"
+            }
+          }
+          $pdbs = @(Get-ChildItem -LiteralPath $bundleDir -Filter *.pdb -File -Recurse)
+          if ($pdbs.Count -gt 0) {
+            throw "Debug files are present in the Windows bundle: $($pdbs.Name -join ', ')"
+          }
+
+      - name: Upload ${{ matrix.arch }} build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-${{ matrix.arch }}-build
+          path: build/windows/${{ matrix.arch }}/runner/Release/
+
+  package-windows:
+    name: Package Windows installer
+    needs: [plan, build-windows]
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: refs/tags/${{ needs.plan.outputs.tag }}
+          persist-credentials: false
+
+      - name: Download patch series
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: patches
+          path: ${{ runner.temp }}/patches
+
+      - name: Apply patches
+        shell: bash
+        run: |
+          git -c user.name=plezy-custom-build -c user.email=plezy-custom-build@users.noreply.github.com \
+            am --quiet "$RUNNER_TEMP"/patches/*.patch
+          flutter_version=$(sed -n -E 's/^[[:space:]]*FLUTTER_VERSION:[[:space:]]*"([^"]+)".*/\1/p' .github/workflows/build.yml)
+          echo "FLUTTER_VERSION=$flutter_version" >> "$GITHUB_ENV"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          cache: true
+          cache-key: "custom-flutter-:os:-:channel:-:version:-:arch:-:hash:"
+          pub-cache: false
+
+      - name: Install dependencies
+        shell: pwsh
+        run: flutter pub get --enforce-lockfile --no-example
+
+      - name: Download x64 build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: windows-x64-build
+          path: build-x64
+
+      - name: Download arm64 build
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: windows-arm64-build
+          path: build-arm64
+
+      - name: Build installer
+        run: .\windows\build-installer.ps1 -X64BuildDir "build-x64" -Arm64BuildDir "build-arm64" -Version "${{ needs.plan.outputs.version }}"
+
+      - name: Sign installer for WinSparkle (EdDSA)
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrEmpty($env:SPARKLE_PRIVATE_KEY)) {
+            throw "SPARKLE_PRIVATE_KEY is not set; installs could not verify this update"
+          }
+          $keyPath = Join-Path $env:RUNNER_TEMP "plezy-winsparkle-ed25519.pem"
+          try {
+            Set-Content -Path $keyPath -Value $env:SPARKLE_PRIVATE_KEY -Encoding ascii -NoNewline
+            $output = & dart run auto_updater:sign_update plezy-windows-installer.exe $keyPath
+            if ($LASTEXITCODE -ne 0) {
+              throw "WinSparkle signer failed with exit code $LASTEXITCODE"
+            }
+            $match = [regex]::Match($output, 'edSignature="([^"]*)"')
+            if (-not $match.Success) {
+              throw "WinSparkle signer returned no EdDSA signature"
+            }
+            Set-Content -Path win-ed-signature.txt -Value $match.Groups[1].Value -Encoding ascii -NoNewline
+            Set-Content -Path win-installer-size.txt -Value (Get-Item plezy-windows-installer.exe).Length.ToString() -Encoding ascii -NoNewline
+          } finally {
+            Remove-Item -Path $keyPath -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Upload installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-installer
+          path: |
+            plezy-windows-installer.exe
+            win-ed-signature.txt
+            win-installer-size.txt
+
+  release:
+    name: Publish release
+    needs: [plan, package-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Download installer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: windows-installer
+          path: artifacts
+
+      - name: Generate appcast.xml and release notes
+        env:
+          FORK: ${{ github.repository }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          BUILD_NUMBER: ${{ needs.plan.outputs.build_number }}
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          FINGERPRINT: ${{ needs.plan.outputs.fingerprint }}
+          HEADS: ${{ needs.plan.outputs.heads }}
+        run: |
+          signature=$(cat artifacts/win-ed-signature.txt)
+          size=$(cat artifacts/win-installer-size.txt)
+          cat > artifacts/appcast.xml << EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">
+            <channel>
+              <title>Plezy Updates (${FORK})</title>
+              <item>
+                <title>Version ${VERSION}</title>
+                <sparkle:version>${BUILD_NUMBER}</sparkle:version>
+                <sparkle:shortVersionString>${VERSION}</sparkle:shortVersionString>
+                <sparkle:releaseNotesLink>https://gh-html.edde746.dev/edde746/plezy/${TAG}</sparkle:releaseNotesLink>
+                <enclosure url="https://github.com/${FORK}/releases/download/${RELEASE_TAG}/plezy-windows-installer.exe"
+                           length="${size}" type="application/octet-stream"
+                           sparkle:edSignature="${signature}"
+                           sparkle:installerArguments="/SILENT /SP-"
+                           sparkle:os="windows" />
+              </item>
+            </channel>
+          </rss>
+          EOF
+          sed -i 's/^          //' artifacts/appcast.xml
+          cat artifacts/appcast.xml
+
+          {
+            echo "Plezy [${TAG}](https://github.com/${UPSTREAM}/releases/tag/${TAG}) for Windows, with this fork's patches:"
+            echo
+            while IFS= read -r head; do
+              [[ -n "$head" ]] && echo "- \`${head%@*}\` at ${head#*@}"
+            done <<< "$HEADS"
+            echo
+            echo "fingerprint: ${FINGERPRINT}"
+          } > notes.md
+          cat notes.md
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$RELEASE_TAG" \
+            --notes-file notes.md \
+            --latest \
+            artifacts/plezy-windows-installer.exe \
+            artifacts/appcast.xml
+
+      # GitHub disables scheduled workflows in public repositories after 60
+      # days without activity, so each release leaves a commit behind.
+      - name: Record the release on this branch
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+        run: |
+          echo "$RELEASE_TAG" > last-release.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add last-release.txt
+          git commit -m "chore: record release $RELEASE_TAG"
+          git push origin "HEAD:$GITHUB_REF_NAME"
